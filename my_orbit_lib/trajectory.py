@@ -7,21 +7,29 @@ from sympy.physics.units import meter, kilometer, second, hour, minute, kilogram
 
 from my_orbit_lib.extensions import strip_units
 
-from my_orbit_lib.body import solve_keplers_problem_rk4
+from my_orbit_lib.body import solve_rk4_fast, NO_FORCES
 from my_orbit_lib.epoch import Epoch
 
+from my_orbit_lib.constants import EARTH_RADIUS
+
+from numba import njit
+
 class Trajectory:
-    def __init__(self, points, epoch_begin, epoch_end, forces_work=[], is_maneuver=False):
+    def __init__(self, points, epoch_begin, epoch_end, end_mass, forces_work=[], is_maneuver=False, landed=False, label=None):
         """
         points       Should be an np.array of shape (n, 2, 3), i.e. pos and vel vectors at 'n' points
         is_maneuver  Should be true if the engines were on during the trajectory (this field
                      is just used as metadata for pretty plots. 
         """
         self.points = points
-        self.forces_work = forces_work
-        self.is_maneuver = is_maneuver
         self.epoch_begin = epoch_begin 
         self.epoch_end = epoch_end
+        self.end_mass = end_mass
+        self.forces_work = forces_work
+        self.is_maneuver = is_maneuver
+        self.landed = landed
+        self.label = label
+        self.color = 'cyan' if is_maneuver else 'darkorange'
 
 def get_trajectory(body, target_epoch=None, duration=None, until_condition_becomes_false=None, step_size=1, hmin=1e-2, hmax=1e2, tol=1e-3):
     """
@@ -69,6 +77,7 @@ def get_trajectory(body, target_epoch=None, duration=None, until_condition_becom
     pos, vel = strip_units(body.pos), strip_units(body.vel)
     duration = strip_units(convert_to(duration, second))
     step_size = strip_units(convert_to(step_size, second))
+    mass = strip_units(convert_to(body.mass, kilogram))
     
     if duration != -1:
         steps = duration/step_size
@@ -83,25 +92,35 @@ def get_trajectory(body, target_epoch=None, duration=None, until_condition_becom
     duration_condition = lambda: steps != -1 and n < steps
     other_condition = lambda: until_condition_becomes_false is not None and until_condition_becomes_false(n, t, pos, vel)
     
+    landed = False
+
     while duration_condition() or other_condition():
-        pos, vel, t, fw = solve_keplers_problem_rk4(pos_0=pos,
-                                                vel_0=vel, 
-                                                t_0=t,
-                                                t_1=t + step_size, 
-                                                hmin=hmin,
-                                                hmax=hmax,
-                                                forces=body.engine,
-                                                mass=body.mass,
-                                                tol=tol,
-                                                nm=np)
-        points.append(np.array([pos.copy(), vel.copy()]))
+        pos, vel, t, fw, mass = solve_rk4_fast(pos_0=pos,
+                                    vel_0=vel,
+                                    t_0=t,
+                                    t_1=t + step_size,
+                                    hmin=hmin,
+                                    hmax=hmax,
+                                    forces=body.engine,
+                                    external_forces=body.external_forces,
+                                    mass=mass,
+                                    tol=tol)
         forces_work.append(forces_work[-1] + fw)
         n += 1
-        
+
+        if np.norm(np.array(pos)) < strip_units(EARTH_RADIUS):
+            landed = True
+            vel = np.array([0, 0, 0])
+
+        points.append(np.array([pos.copy(), vel.copy()]))
+
+        if landed:
+            break
+
     epoch_begin = body.epoch
     epoch_end = Epoch(body.epoch.jde + t/86400)
-    is_maneuver = body.engine is not None
-    return Trajectory(np.array(points), forces_work=forces_work, epoch_begin=epoch_begin, epoch_end=epoch_end, is_maneuver=is_maneuver)
+    is_maneuver = body.engine != NO_FORCES
+    return Trajectory(np.array(points), epoch_begin=epoch_begin, epoch_end=epoch_end, end_mass=mass, forces_work=forces_work, is_maneuver=is_maneuver, landed=landed)
 
 def plot_trajectory(trajectories=[], body=None, vel_arrow_scale=400, x_view_angle=-75, y_view_angle=25, scale=0.7):
     """
@@ -123,8 +142,8 @@ def plot_trajectory(trajectories=[], body=None, vel_arrow_scale=400, x_view_angl
     ax.grid(False)
     
     # Coordinate system arrows
-    EARTH_RADIUS = 6371 # km
-    r = EARTH_RADIUS * 0.8
+    RADIUS = strip_units(EARTH_RADIUS)
+    r = RADIUS * 0.8
     ax.quiver([0], [0], [0], [r], [0], [0], color='r', linewidth = 0.5)
     ax.quiver([0], [0], [0], [0], [r], [0], color='g', linewidth = 0.5)
     ax.quiver([0], [0], [0], [0], [0], [r], color='b', linewidth = 0.5)
@@ -135,7 +154,7 @@ def plot_trajectory(trajectories=[], body=None, vel_arrow_scale=400, x_view_angl
     y = np.sin(u) * np.sin(v)
     z = np.cos(v)
 
-    r = EARTH_RADIUS
+    r = RADIUS
     ax.plot_wireframe(x * r, y * r, z * r, color=(0.1, 0.2, 0.5, 0.2), linewidth=0.5)
 
     # Plot first body position 
@@ -187,7 +206,7 @@ def plot_trajectory(trajectories=[], body=None, vel_arrow_scale=400, x_view_angl
     plt.legend(loc='upper left', bbox_to_anchor=(1.3, 1), borderaxespad=0)
 
     # Rest of plot
-    r = EARTH_RADIUS * scale
+    r = RADIUS * scale
     ax.set_xlim(-r, r)
     ax.set_ylim(-r, r)
     ax.set_zlim(-r, r)
